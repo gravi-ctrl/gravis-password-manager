@@ -15,15 +15,6 @@
 
 ## Installation
 
-```
-git clone https://github.com/yourusername/password-manager.git
-cd password-manager
-
-## Run the script
-
-```sh
-python g-pwm.py
-
 ### Prerequisites
 
 - Python 3.x
