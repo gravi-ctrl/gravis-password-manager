@@ -7,9 +7,10 @@ import os
 import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives import padding, hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from getpass import getpass
-from cryptography.exceptions import InvalidSignature
 import pyotp
 from argon2 import PasswordHasher
 from argon2.low_level import hash_secret_raw, Type
@@ -36,41 +37,38 @@ class PasswordManager:
 
     def set_encryption_key(self, password): # Set the encryption key using the derived key.
         self.salt = secrets.token_bytes(16)  # Generate a random salt
-        self.hashed_password = self.password_hasher.hash(password.encode())  # Store hashed password
+        self.hashed_password = self.password_hasher.hash(password)  # Store hashed password
         self.key = self.derive_key(password, self.salt)
 
     def verify_password(self, password): # Verify the provided password against the stored hash.
         try:
-            self.password_hasher.verify(self.hashed_password, password.encode())
+            self.password_hasher.verify(self.hashed_password, password)
             return True
         except ValueError:
             return False
 
-    def encrypt(self, data): # Encrypt data using AES-256 in CBC mode.
+    def encrypt(self, data): # Encrypt data using AES-256 in GCM mode.
         if self.key:
-            iv = secrets.token_bytes(16)  # Generate a random IV
-            cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=default_backend())
+            iv = secrets.token_bytes(12)  # Generate a random IV
+            cipher = Cipher(algorithms.AES(self.key), modes.GCM(iv), backend=default_backend())
             encryptor = cipher.encryptor()
             data_bytes = data.encode()
-            padder = padding.PKCS7(algorithms.AES.block_size).padder()
-            padded_data = padder.update(data_bytes) + padder.finalize()
-            encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-            return base64.urlsafe_b64encode(iv + encrypted_data).decode()
+            encrypted_data = encryptor.update(data_bytes) + encryptor.finalize()
+            return base64.urlsafe_b64encode(iv + encryptor.tag + encrypted_data).decode()
         return data
 
-    def decrypt(self, encrypted_data): # Decrypt data using AES-256 in CBC mode
+    def decrypt(self, encrypted_data): # Decrypt data using AES-256 in GCM mode.
         if self.key:
             encrypted_data_bytes = base64.urlsafe_b64decode(encrypted_data.encode())
-            iv = encrypted_data_bytes[:16]
-            encrypted_data_bytes = encrypted_data_bytes[16:]
-            cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=default_backend())
+            iv = encrypted_data_bytes[:12]
+            tag = encrypted_data_bytes[12:28]
+            encrypted_data_bytes = encrypted_data_bytes[28:]
+            cipher = Cipher(algorithms.AES(self.key), modes.GCM(iv, tag), backend=default_backend())
             decryptor = cipher.decryptor()
             try:
                 decrypted_data = decryptor.update(encrypted_data_bytes) + decryptor.finalize()
-                unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
-                unpadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
-                return unpadded_data.decode()
-            except ValueError as e:
+                return decrypted_data.decode()
+            except Exception as e:
                 print(f"Decryption failed: {e}")
                 return None
         return encrypted_data
@@ -249,126 +247,87 @@ class PasswordManager:
                 }
                 for entry in self.entries
             ],
-            "salt": base64.urlsafe_b64encode(self.salt).decode(),  # Store the salt used for encryption
-            "hashed_password": self.hashed_password  # Store the hashed password
+            "salt": base64.urlsafe_b64encode(self.salt).decode()
         }
 
-        directory = os.path.dirname(filepath)
-        if directory and not os.path.exists(directory):
-            os.makedirs(directory)
+        with open(filepath, 'w') as f:
+            json.dump(encrypted_entries, f)
+        print(f"Entries saved to {filepath}.")
 
-        try:
-            with open(filepath, 'w') as f:
-                f.write(json.dumps(encrypted_entries))
-            print(f"Entries saved to {filepath}.")
-        except Exception as e:
-            print(f"Failed to save JSON file: {e}")
+    def load_from_json(self, filepath): # Load entries from a JSON file with decryption.
+        with open(filepath, 'r') as f:
+            encrypted_data = json.load(f)
 
-    def load_from_json(self, filepath): # Load entries from an encrypted JSON file.
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, 'r') as f:
-                    encrypted_entries = json.load(f)
+        salt = base64.urlsafe_b64decode(encrypted_data["salt"])
+        password = getpass("Enter decryption password: ")
+        
+        if not self.key:
+            self.set_encryption_key(password)
+        if not self.verify_password(password):
+            print("Incorrect password. Failed to load entries.")
+            self.prompt_to_menu()
+            return
 
-                if 'salt' not in encrypted_entries or 'hashed_password' not in encrypted_entries:
-                    print("Invalid JSON file format. Missing required keys.")
-                    return
+        self.key = self.derive_key(password, salt)
 
-                self.salt = base64.urlsafe_b64decode(encrypted_entries['salt'])
-                self.hashed_password = encrypted_entries['hashed_password']
+        decrypted_entries = [
+            {
+                "title": self.decrypt(entry['title']),
+                "username": self.decrypt(entry['username']),
+                "password": self.decrypt(entry['password']),
+                "url": self.decrypt(entry['url']),
+                "otp_secret": self.decrypt(entry['otp_secret']) if entry['otp_secret'] else "",
+                "notes": self.decrypt(entry['notes']) if entry['notes'] else ""
+            }
+            for entry in encrypted_data["entries"]
+        ]
+        self.entries = decrypted_entries
+        print("Entries loaded successfully.")
 
-                password = getpass("Enter encryption password: ")
-                if not self.verify_password(password):
-                    print("Incorrect password.")
-                    return
+    def prompt_to_menu(self):
+        input("\nPress Enter to return to the menu...")
 
-                self.key = self.derive_key(password, self.salt)
-
-                decrypted_entries = []
-                for entry in encrypted_entries['entries']:
-                    try:
-                        decrypted_entry = {
-                            "title": self.decrypt(entry['title']),
-                            "username": self.decrypt(entry['username']),
-                            "password": self.decrypt(entry['password']),
-                            "url": self.decrypt(entry['url']),
-                            "otp_secret": self.decrypt(entry['otp_secret']) if entry['otp_secret'] else "",
-                            "notes": self.decrypt(entry['notes']) if entry['notes'] else ""
-                        }
-                        if None in decrypted_entry.values():
-                            print("Incorrect password or corrupted data. Failed to load entries.")
-                            break
-                        decrypted_entries.append(decrypted_entry)
-                    except (InvalidSignature, ValueError):
-                        print("Incorrect password or corrupted data. Failed to load entries.")
-                        break
-                    except Exception as e:
-                        print(f"Error during decryption: {e}")
-                        break
-
-                else:
-                    self.entries = decrypted_entries
-                    print("Entries loaded from JSON file.")
-                    self.view_entries()
-            except json.JSONDecodeError as e:
-                print(f"Failed to load JSON file: {e}. The file might be corrupted or the password might be incorrect.")
-            except Exception as e:
-                print(f"Error during loading: {e}")
+def main_menu():
+    manager = PasswordManager()
+    while True:
+        print("\ngravi-ctrl Password Manager")
+        print("==========================+")
+        print("1. Create new entry")
+        print("2. Delete entry")
+        print("3. Modify entry")
+        print("4. View entries")
+        print("5. Access entry")
+        print("6. View OTP")
+        print("7. Save to JSON")
+        print("8. Load from JSON")
+        print("9. Exit")
+        print("")
+        print("Created by Ahmed Abdelrahman")
+        print("")
+        choice = input("Enter your choice: ")
+        print("")
+        if choice == '1':
+            manager.create_new_entry()
+        elif choice == '2':
+            manager.delete_entry()
+        elif choice == '3':
+            manager.modify_entry()
+        elif choice == '4':
+            manager.view_entries()
+        elif choice == '5':
+            manager.access_entry()
+        elif choice == '6':
+            manager.view_otp()
+        elif choice == '7':
+            filepath = input("Enter the file path to save JSON: ")
+            manager.save_to_json(filepath)
+        elif choice == '8':
+            filepath = input("Enter the file path to load JSON: ")
+            manager.load_from_json(filepath)
+        elif choice == '9':
+            break
         else:
-            print("JSON file not found.")
-
-    def prompt_to_menu(self): # Prompt user to return to the main menu or exit.
-        choice = input("Type 'menu' to go back to the main menu or '(e)xit' to quit: ").strip().lower()
-        if choice == 'exit' or choice == 'e':
-            exit()
-
-    def menu(self): # Main menu loop.
-        while True:
-            print("\ngravi-ctrl's Password Manager:")
-            print("-------------------------------")
-            print("1. Create new entry")
-            print("2. Delete entry")
-            print("3. Modify entry")
-            print("4. View entries")
-            print("5. Access entry details")
-            print("6. View OTP")
-            print("7. Save to JSON")
-            print("8. Load from JSON")
-            print("9. Exit")
-            print(" ")
-            print("Created by Ahmed Abdelrahman")
-            print(" ")
-
-            choice = input("Enter your choice: ").strip()
-            print(" ")
-            if choice == '1':
-                self.create_new_entry()
-            elif choice == '2':
-                self.delete_entry()
-            elif choice == '3':
-                self.modify_entry()
-            elif choice == '4':
-                self.view_entries()
-            elif choice == '5':
-                self.access_entry()
-            elif choice == '6':
-                self.view_otp()
-            elif choice == '7':
-                filepath = input("Enter JSON file path to save: ")
-                if not filepath.endswith('.json'):
-                    filepath += '.json'
-                self.save_to_json(filepath)
-            elif choice == '8':
-                filepath = input("Enter JSON file path to load: ")
-                if not filepath.endswith('.json'):
-                    filepath += '.json'
-                self.load_from_json(filepath)
-            elif choice == '9':
-                print("Exiting Password Manager.")
-                break
-            else:
-                print("Invalid choice. Please try again.")
+            print("Invalid choice. Please try again.")
 
 if __name__ == "__main__":
-    manager = PasswordManager()
-    manager.menu()
+    main_menu()
